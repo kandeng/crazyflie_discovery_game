@@ -1,0 +1,8 @@
+# Crazyflie Bridge Dependencies
+#
+# Install with:
+#   conda activate crazyflie
+#   pip install -r requirements.txt
+
+cflib
+websockets
