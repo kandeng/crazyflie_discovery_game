@@ -73,7 +73,7 @@ export default function App() {
         </div>
 
         {/* Telemetry overlay at bottom of viewport */}
-        <TelemetryOverlay telemetry={telemetry} wsStatus={status} />
+        <TelemetryOverlay telemetry={telemetry} />
 
         {/* Joystick overlay */}
         <div className="absolute inset-0 z-20 pointer-events-none">

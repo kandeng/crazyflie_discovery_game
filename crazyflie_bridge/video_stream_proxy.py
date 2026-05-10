@@ -15,13 +15,15 @@ Endpoints:
 """
 
 import argparse
+import os
 import threading
 import http.server
 import socketserver
 import urllib.request
 import time
 
-UPSTREAM_URL = "http://192.168.0.111/stream"
+CRAZYFLIE_IP = os.environ.get("CRAZYFLIE_IP", "192.168.0.106")
+UPSTREAM_URL = f"http://{CRAZYFLIE_IP}/stream"
 PROXY_PORT = 8082
 
 _latest_frame = None
@@ -32,6 +34,11 @@ _running = True
 def fetch_stream(upstream_url):
     """Background thread: continuously fetch MJPEG frames from the ESP32."""
     global _latest_frame, _running
+
+    # Build an opener that bypasses system HTTP proxies (they can cause 502s
+    # when hitting local / non-routable addresses like the ESP32 AP).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     while _running:
         try:
             req = urllib.request.Request(
@@ -45,7 +52,7 @@ def fetch_stream(upstream_url):
                     "Accept": "*/*",
                 },
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with opener.open(req, timeout=10) as resp:
                 print(f"[Proxy] Connected to upstream: {upstream_url}")
                 buffer = bytearray()
                 while _running:

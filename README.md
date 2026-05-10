@@ -50,30 +50,55 @@ The production bundle is output to the `dist/` directory.
 
 ### Start the System
 
-**1. Start the Crazyflie Bridge** (video proxy + WebSocket motion server):
-
-```bash
-cd crazyflie_bridge
-./start_bridge.sh
-```
-
-You can optionally pass a custom Crazyflie radio URI:
-
-```bash
-./start_bridge.sh --cf-uri radio://0/80/2M/E7E7E7E7E7
-```
-
-This launches two services:
-- **Video proxy** — `http://localhost:8082/stream`
-- **WebSocket bridge** — `ws://localhost:8765`
-
-**2. Start the Frontend Dev Server** (or serve the built `dist/` folder):
+**1. Start the Frontend Dev Server:**
 
 ```bash
 npm run dev
 ```
 
-The app is available at `http://localhost:5175`.
+The app is available at `http://localhost:5175` (or via network IP for mobile access).
+
+**2. Start the Motion Control Bridge** (connects to Crazyflie via radio):
+
+```bash
+cd crazyflie_bridge
+conda activate crazyflie
+python3 motion_control_ws.py
+```
+
+This launches the WebSocket bridge at `ws://0.0.0.0:8765`.
+
+> **Emergency stop:** Press **Ctrl+C** in the terminal running `motion_control_ws.py` to immediately land the drone and shut down the bridge. The drone will perform a gentle auto-landing before the script exits.
+
+**3. Start the Video Stream Proxy:**
+
+The Crazyflie's ESP32 camera gets a **dynamic IP via DHCP** each time it boots. You must set the `CRAZYFLIE_IP` environment variable to the drone's current IP before starting the proxy:
+
+```bash
+# Find the drone's IP (check your router's DHCP leases, or scan the network)
+nmap -sn 192.168.0.0/24
+
+# Start the proxy with the correct IP
+CRAZYFLIE_IP=192.168.0.106 python3 video_stream_proxy.py
+```
+
+The proxy runs at `http://localhost:8082/stream`.
+
+> **Important:** Do NOT open the drone's stream URL (`http://<drone-ip>/stream`) directly in a browser while the proxy is running. The ESP32 camera only supports **one HTTP connection at a time** — if a browser holds it, the proxy will time out.
+
+**Alternative: Use the combined launcher:**
+
+```bash
+CRAZYFLIE_IP=192.168.0.106 ./start_bridge.sh
+```
+
+This starts both the video proxy and motion control bridge together.
+
+You can also pass a custom radio URI:
+
+```bash
+CRAZYFLIE_IP=192.168.0.106 ./start_bridge.sh --cf-uri radio://0/80/2M/E7E7E7E7E7
+```
 
 ---
 

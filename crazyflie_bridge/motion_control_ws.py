@@ -13,11 +13,18 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import queue
 import signal
 import sys
 import threading
 import time
+import warnings
+from contextlib import contextmanager
+
+# Suppress cflib deprecation / firmware-version warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -58,6 +65,27 @@ class CrazyflieBridge:
         self._scf = None
         self._clients = set()
 
+        # Current height tracked from telemetry (thread-safe via GIL for float)
+        self._current_z = 0.0
+
+    # ------------------------------------------------------------------ #
+    #  Helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _suppress_stderr():
+        """Context manager that temporarily silences stderr (for cflib noise)."""
+        @contextmanager
+        def _cm():
+            old_stderr = sys.stderr
+            sys.stderr = open(os.devnull, 'w')
+            try:
+                yield
+            finally:
+                sys.stderr.close()
+                sys.stderr = old_stderr
+        return _cm()
+
     # ------------------------------------------------------------------ #
     #  Public API
     # ------------------------------------------------------------------ #
@@ -65,7 +93,7 @@ class CrazyflieBridge:
     def start(self):
         """Initialize CRTP drivers and spin up the Crazyflie worker thread."""
         cflib.crtp.init_drivers()
-        self._cf_thread = threading.Thread(target=self._cf_worker, daemon=True)
+        self._cf_thread = threading.Thread(target=self._cf_worker, daemon=False)
         self._cf_thread.start()
 
     async def run(self):
@@ -80,6 +108,11 @@ class CrazyflieBridge:
     def stop(self):
         """Signal all loops to exit."""
         self._running = False
+
+    def join(self, timeout=10):
+        """Wait for the Crazyflie worker thread to finish (e.g. after landing)."""
+        if self._cf_thread and self._cf_thread.is_alive():
+            self._cf_thread.join(timeout=timeout)
 
     # ------------------------------------------------------------------ #
     #  WebSocket Server Handler
@@ -134,10 +167,16 @@ class CrazyflieBridge:
                     print(f"[Bridge] Crazyflie connected: {self.cf_uri}")
 
                     self._setup_logging(scf.cf)
-                    scf.cf.platform.send_arming_request(True)
+                    # Try new supervisor arming first (firmware v12+), fallback to legacy
+                    try:
+                        scf.cf.supervisor.send_arming_request(True)
+                    except (AttributeError, Exception):
+                        scf.cf.platform.send_arming_request(True)
                     time.sleep(1.0)
 
-                    with MotionCommander(scf, default_height=None) as mc:
+                    with self._suppress_stderr():
+                        mc = MotionCommander(scf, default_height=0.5)
+                    with mc:
                         self._motion_commander = mc
                         print("[Bridge] MotionCommander ready. Waiting for commands...")
 
@@ -149,6 +188,14 @@ class CrazyflieBridge:
                                 pass
                             time.sleep(0.01)
 
+                        # Ctrl-C / shutdown — land the drone before exiting
+                        print("[Bridge] Landing drone...")
+                        try:
+                            self._gentle_land()
+                        except Exception as e:
+                            print(f"[Bridge] Land failed: {e}")
+                        time.sleep(0.5)
+
             except Exception as e:
                 print(f"[Bridge] Crazyflie error: {e}")
                 self._motion_commander = None
@@ -158,37 +205,40 @@ class CrazyflieBridge:
 
     def _setup_logging(self, cf):
         """Register log blocks for position, attitude, and battery."""
-        log_pos = LogConfig(name='Position', period_in_ms=self.telemetry_period_ms)
-        log_pos.add_variable('stateEstimate.x', 'float')
-        log_pos.add_variable('stateEstimate.y', 'float')
-        log_pos.add_variable('stateEstimate.z', 'float')
-        cf.log.add_config(log_pos)
-        log_pos.data_received_cb.add_callback(self._on_position)
-        log_pos.start()
+        with self._suppress_stderr():
+            log_pos = LogConfig(name='Position', period_in_ms=self.telemetry_period_ms)
+            log_pos.add_variable('stateEstimate.x', 'float')
+            log_pos.add_variable('stateEstimate.y', 'float')
+            log_pos.add_variable('stateEstimate.z', 'float')
+            cf.log.add_config(log_pos)
+            log_pos.data_received_cb.add_callback(self._on_position)
+            log_pos.start()
 
-        log_stab = LogConfig(name='Stabilizer', period_in_ms=self.telemetry_period_ms)
-        log_stab.add_variable('stabilizer.roll', 'float')
-        log_stab.add_variable('stabilizer.pitch', 'float')
-        log_stab.add_variable('stabilizer.yaw', 'float')
-        cf.log.add_config(log_stab)
-        log_stab.data_received_cb.add_callback(self._on_attitude)
-        log_stab.start()
+            log_stab = LogConfig(name='Stabilizer', period_in_ms=self.telemetry_period_ms)
+            log_stab.add_variable('stabilizer.roll', 'float')
+            log_stab.add_variable('stabilizer.pitch', 'float')
+            log_stab.add_variable('stabilizer.yaw', 'float')
+            cf.log.add_config(log_stab)
+            log_stab.data_received_cb.add_callback(self._on_attitude)
+            log_stab.start()
 
-        log_batt = LogConfig(name='Battery', period_in_ms=1000)
-        log_batt.add_variable('pm.vbat', 'FP16')
-        cf.log.add_config(log_batt)
-        log_batt.data_received_cb.add_callback(self._on_battery)
-        log_batt.start()
+            log_batt = LogConfig(name='Battery', period_in_ms=1000)
+            log_batt.add_variable('pm.vbat', 'FP16')
+            cf.log.add_config(log_batt)
+            log_batt.data_received_cb.add_callback(self._on_battery)
+            log_batt.start()
 
     # ------------------------------------------------------------------ #
     #  Telemetry callbacks (Crazyflie thread -> asyncio queue)
     # ------------------------------------------------------------------ #
 
     def _on_position(self, timestamp, data, logconf):
+        z = data.get('stateEstimate.z', data.get('kalman.stateZ', 0))
+        self._current_z = z
         self._enqueue_telemetry("position", timestamp, {
-            "x": data.get('stateEstimate.x', 0),
-            "y": data.get('stateEstimate.y', 0),
-            "z": data.get('stateEstimate.z', 0)
+            "x": data.get('stateEstimate.x', data.get('kalman.stateX', 0)),
+            "y": data.get('stateEstimate.y', data.get('kalman.stateY', 0)),
+            "z": z
         })
 
     def _on_attitude(self, timestamp, data, logconf):
@@ -224,6 +274,63 @@ class CrazyflieBridge:
         asyncio.run_coroutine_threadsafe(_put(), self._loop)
 
     # ------------------------------------------------------------------ #
+    #  Descent speed limiting & gentle landing
+    # ------------------------------------------------------------------ #
+
+    def _clamp_descent(self, vz):
+        """
+        Scale down the descent speed when the drone is below 0.5 m.
+
+        Returns a negative (downward) velocity whose magnitude is reduced
+        proportionally to the current height:
+          - At 0.5 m or above:  full requested speed
+          - At 0.25 m:          ~half speed
+          - At 0.10 m:          ~20 % speed  (minimum 0.03 m/s)
+        """
+        z = max(self._current_z, 0.0)
+        threshold = 0.5          # metres – start slowing below this
+        min_speed = 0.03         # m/s – never slower than this (avoids stall)
+
+        if z >= threshold:
+            return vz            # above threshold, full speed
+
+        scale = max(z / threshold, min_speed / abs(vz) if vz != 0 else 0)
+        return vz * scale
+
+    def _gentle_land(self):
+        """
+        Land the drone with a slow, controlled descent instead of the
+        default MotionCommander.land() which can be abrupt.
+
+        Strategy: descend at progressively slower speeds as height decreases,
+        then stop motors once effectively on the ground.
+        """
+        mc = self._motion_commander
+        if mc is None:
+            return
+
+        print("[Bridge] Gentle landing...")
+
+        # Phase 1: descend to ~0.15 m at a moderate speed
+        while self._current_z > 0.15:
+            speed = max(0.05, min(0.2, self._current_z * 0.4))
+            mc.start_linear_motion(0, 0, -speed, 0)
+            time.sleep(0.05)
+
+        # Phase 2: very slow final descent
+        while self._current_z > 0.04:
+            mc.start_linear_motion(0, 0, -0.03, 0)
+            time.sleep(0.05)
+
+        # Phase 3: cut motors
+        mc.stop()
+        # Send zero thrust to let it settle
+        if self._scf:
+            self._scf.cf.commander.send_stop_setpoint()
+        time.sleep(0.3)
+        print("[Bridge] Landed.")
+
+    # ------------------------------------------------------------------ #
     #  Command dispatch (Crazyflie thread)
     # ------------------------------------------------------------------ #
 
@@ -240,20 +347,23 @@ class CrazyflieBridge:
             if action == "takeoff":
                 self._motion_commander.take_off(height=cmd.get("height", 0.5))
             elif action == "land":
-                self._motion_commander.land()
+                self._gentle_land()
             elif action == "stop":
                 self._motion_commander.stop()
             elif action == "move":
-                self._motion_commander.start_linear_motion(
-                    cmd.get("vx", 0),
-                    cmd.get("vy", 0),
-                    cmd.get("vz", 0),
-                    cmd.get("yawrate", 0)
-                )
+                vx = cmd.get("vx") or 0
+                vy = cmd.get("vy") or 0
+                vz = cmd.get("vz") or 0
+                yawrate = cmd.get("yawrate") or 0
+                # Clamp downward speed when close to ground
+                if vz < 0:
+                    vz = self._clamp_descent(vz)
+                self._motion_commander.start_linear_motion(vx, vy, vz, yawrate)
             elif action == "up":
                 self._motion_commander.up(cmd.get("distance", 0.2))
             elif action == "down":
-                self._motion_commander.down(cmd.get("distance", 0.2))
+                self._motion_commander.down(cmd.get("distance", 0.2),
+                                            velocity=self._clamp_descent(-0.2))
             elif action == "forward":
                 self._motion_commander.forward(cmd.get("distance", 0.2))
             elif action == "back":
@@ -293,6 +403,7 @@ def main():
     def handle_signal(sig, frame):
         print("\n[Bridge] Shutting down...")
         bridge.stop()
+        bridge.join(timeout=10)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -303,6 +414,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[Bridge] Shutting down...")
         bridge.stop()
+        bridge.join(timeout=10)
 
 
 if __name__ == "__main__":

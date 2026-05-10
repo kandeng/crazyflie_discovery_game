@@ -1,4 +1,6 @@
+const host = window.location.hostname;
+
 export const BRIDGE_CONFIG = {
-  videoStreamUrl: 'http://localhost:8082/stream',
-  wsUrl: 'ws://localhost:8765',
+  videoStreamUrl: '/api/stream',
+  wsUrl: `ws://${host}:8765`,
 };
