@@ -6,6 +6,12 @@ A Progressive Web App (PWA) that lets you pilot a physical [Crazyflie](https://w
 
 Control the flying motion of a Crazyflie nano-drone, retrieve the live MJPEG video stream captured by its ESP32-S3 AI-Deck camera, and display it within a mobile-friendly PWA interface — all from your phone or desktop browser.
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=76eWsmXcdDA">
+    <img src="https://img.youtube.com/vi/76eWsmXcdDA/maxresdefault.jpg" alt="Crazyflie Discovery Game" style="width:80%;">
+  </a>
+</p>
+
 ---
 
 ## Getting Started
