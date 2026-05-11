@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { Joystick, ChatPanel } from 'mobile_game_pwa';
 import VideoStream from './components/VideoStream';
 import TelemetryOverlay from './components/TelemetryOverlay';
@@ -11,17 +11,31 @@ export default function App() {
   const [toolboxOpen, setToolboxOpen] = useState(false);
   const [chatHeight, setChatHeight] = useState(30);
 
+  // Track whether the drone has ever been above 0.5m (i.e. has taken off)
+  const hasFlownRef = useRef(false);
+  if (telemetry.z > 0.5) hasFlownRef.current = true;
+
+  const isLow = telemetry.z < 0.5;
+  const showTakeoffHint = !hasFlownRef.current && isLow;
+  const showLandingWarning = hasFlownRef.current && isLow && telemetry.z > 0.02;
+
   /* ---- Joystick -> WebSocket command mapping ---- */
 
   const onMove = useCallback((vx: number, vy: number) => {
+    // Block movement before takeoff
+    if (!hasFlownRef.current) return;
     sendCommand({ action: 'move', vx, vy, vz: 0, yawrate: 0 });
   }, [sendCommand]);
 
   const onRotate = useCallback((vyaw: number) => {
+    // Block rotation before takeoff
+    if (!hasFlownRef.current) return;
     sendCommand({ action: 'move', vx: 0, vy: 0, vz: 0, yawrate: vyaw });
   }, [sendCommand]);
 
   const onHeight = useCallback((vz: number) => {
+    // Before takeoff: only allow upward movement
+    if (!hasFlownRef.current && vz < 0) return;
     sendCommand({ action: 'move', vx: 0, vy: 0, vz, yawrate: 0 });
   }, [sendCommand]);
 
@@ -75,9 +89,30 @@ export default function App() {
         {/* Telemetry overlay at bottom of viewport */}
         <TelemetryOverlay telemetry={telemetry} />
 
+        {/* Instruction overlay (middle layer: above video, below joystick) */}
+        {showTakeoffHint && (
+          <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none">
+            <div className="bg-black/50 backdrop-blur-sm rounded-lg px-6 py-4">
+              <p className="text-white text-base font-medium text-center">
+                点击上升按钮，让无人机起飞
+              </p>
+            </div>
+          </div>
+        )}
+        {showLandingWarning && (
+          <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none">
+            <div className="bg-black/50 backdrop-blur-sm rounded-lg px-6 py-4">
+              <p className="text-yellow-300 text-base font-medium text-center">
+                如果继续下降，无人机将着陆
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Joystick overlay */}
         <div className="absolute inset-0 z-20 pointer-events-none">
           <Joystick
+            modeOrder={['height', 'move', 'rotate', 'lens']}
             onMove={onMove}
             onRotate={onRotate}
             onHeight={onHeight}
